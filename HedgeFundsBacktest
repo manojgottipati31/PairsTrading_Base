@@ -1,0 +1,221 @@
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import yfinance as yf
+from datetime import date
+from scipy import stats
+from tqdm import trange
+from tqdm import tqdm
+import multiprocessing
+
+yf.__version__
+
+tickers = pd.read_excel(r'/Users/manojgottipati/Downloads/tickers.xlsx', index_col='Symbol')
+tickers_list = list(tickers.index)
+
+# get sector list to loop over for correlation matrix
+sectors_list = list(tickers['GICS Sector'].value_counts().reset_index()['index'])
+today = date.today()
+
+df = pd.read_csv(r'/Users/manojgottipati/Downloads/a.csv')
+df=df.dropna(axis=0)
+
+li=[]
+for i in tqdm(sectors_list):
+    
+    # get all tickets present in one particcular sector
+    ticker_list_mini = list(tickers[tickers['GICS Sector']==i].index)
+
+    # get correlation matrox
+    
+    corr_matrix = df[list(set(ticker_list_mini).intersection(set(df.columns)))].corr()
+
+    # select oly the top half of the correlation matrix
+    corr_matrix=corr_matrix.where(np.triu(np.ones(corr_matrix.shape)).astype(np.bool))
+    corr_matrix=corr_matrix.stack().reset_index()
+
+    # sort correlation df in ascending order
+    corr_matrix=corr_matrix.sort_values(by=[0])
+
+    # remove entries tht are self-correlated
+    corr_matrix=corr_matrix[corr_matrix['level_0']!=corr_matrix['level_1']]
+
+    # get the top 100 pairs based on correlation
+    high_corr_df_mini=corr_matrix[-100:]
+
+    li.append(high_corr_df_mini)
+   
+# get a combined df for top 100 pairs for all 11 sectors
+high_corr_df = pd.concat(li)
+
+# used to calculated daily mean and std to find 2 sigma nd 1 sigm values
+df['n'] = list(range(1,len(df)+1))
+
+def backTest(high_corr_df,df): 
+
+    stock1_list = []
+    stock2_list = []
+    entry_price_s1_list = []
+    entry_price_s2_list = []
+    exit_price_s1_list = []
+    exit_price_s2_list = []
+    pos_s1_list = []
+    pos_s2_list = []
+    entry_time_list=[]
+    exit_time_list=[]
+
+    # for ech pair in the final correlation df
+    for i in trange(len(high_corr_df)):
+        df_pair_tr = df[['Date','n',high_corr_df['level_0'].iloc[i],high_corr_df['level_1'].iloc[i]]]
+
+        # get ratio of prices
+        df[high_corr_df['level_0'].iloc[i]+'_'+high_corr_df['level_1'].iloc[i]]=df[high_corr_df['level_0'].iloc[i]]/df[high_corr_df['level_1'].iloc[i]]
+        
+
+        # get z-score
+        df[high_corr_df['level_0'].iloc[i]+'_'+high_corr_df['level_1'].iloc[i]+'_zscr']=stats.zscore(df[high_corr_df['level_0'].iloc[i]+'_'+high_corr_df['level_1'].iloc[i]])
+        pair = high_corr_df['level_0'].iloc[i]+'_'+high_corr_df['level_1'].iloc[i]
+
+        # check for trade entry signals
+        df_pair_tr[pair.split('_')[0]+'_long'] = np.where(df[pair+'_zscr'] < -2, 1, 0)
+        df_pair_tr[pair.split('_')[1]+'_long'] = np.where(df[pair+'_zscr'] > 2, 1, 0)
+        df_pair_tr[pair.split('_')[0]+'_short'] = np.where(df[pair+'_zscr'] > 2, -1, 0)
+        df_pair_tr[pair.split('_')[1]+'_short'] = np.where(df[pair+'_zscr'] < -2, -1, 0)
+
+        # calculate a flag for trade which
+        df_pair_tr['trade'] = np.where((df_pair_tr[pair.split('_')[0]+'_long']==1)|
+                                        (df_pair_tr[pair.split('_')[1]+'_long']==1)|
+                                        (df_pair_tr[pair.split('_')[0]+'_short']==-1)|
+                                        (df_pair_tr[pair.split('_')[1]+'_short']==-1),1,0)
+        
+        # check for exit condition
+        df_pair_tr['exit'] = np.where(abs(df[pair+'_zscr'])<1,1,0)
+
+        # backtest only from 2018
+        df_pair_tr = df_pair_tr[pd.to_datetime(df_pair_tr['Date'])>pd.to_datetime('2018-01-01')]
+        
+
+
+        # store df_pair_tr in another variable so that we can reuse it.
+        df_ticker_long=df_pair_tr
+   
+        # check for trade signal in df_ticker_long
+        while (len(df_ticker_long[:-1][df_ticker_long['trade'][:-1] == 1])!=0):
+            
+            # get entry details (price, time, etc.)
+            entry_price_df = df_ticker_long.iloc[df_ticker_long.index.get_loc(df_ticker_long[(df_ticker_long['trade'] == 1)].index.min())+1]
+            entry_df = df_ticker_long.iloc[df_ticker_long.index.get_loc(df_ticker_long[df_ticker_long['trade'] == 1].index.min())]
+            
+
+            # if numerator stock is long
+            if entry_df[pair.split('_')[0]+"_long"]==1:
+                entry_price_long = float(entry_price_df[pair.split('_')[0]])
+                entry_price_short = float(entry_price_df[pair.split('_')[1]])
+
+                # get trading_df that has data after entring the trade
+                trading_df = df_ticker_long.iloc[df_ticker_long.index.get_loc(df_ticker_long[df_ticker_long['trade'] == 1].index.min())+2: ]
+
+                # check for exit signal during trading
+                if trading_df['exit'].sum()!=0:
+                    exit_df = trading_df.iloc[trading_df.index.get_loc(trading_df[trading_df['exit'] == 1].index.min())]
+                    exit_price_df = trading_df.iloc[trading_df.index.get_loc(trading_df[trading_df['exit'] == 1].index.min())+1]
+                    exit_price_long = float(exit_price_df[pair.split('_')[0]])
+                    exit_price_short = float(exit_price_df[pair.split('_')[1]])
+                
+                # if no exit signal, exit at the last available time
+                else:
+                    exit_price_long = trading_df[pair.split('_')[0]].iloc[-1]
+                    exit_price_short = trading_df[pair.split('_')[1]].iloc[-1]
+                    break;
+                    
+                # remove days that were passed during trading so that we can repeat
+                # this process for the upcoming days
+                df_ticker_long = trading_df.iloc[trading_df.index.get_loc(trading_df[trading_df['exit'] == 1].index.min())+2: ]
+
+                # store trade details (entry, exit, etc.)
+                stock1_list.append(high_corr_df['level_0'].iloc[i])
+                stock2_list.append(high_corr_df['level_1'].iloc[i])
+                entry_price_s1_list.append(entry_price_long)
+                entry_price_s2_list.append(entry_price_short)
+                exit_price_s1_list.append(exit_price_long)
+                exit_price_s2_list.append(exit_price_short)
+                pos_s1_list.append('long')
+                pos_s2_list.append('short')
+                entry_time_list.append(entry_price_df['Date'])
+                exit_time_list.append(exit_price_df['Date'])
+            else:
+
+                break;
+
+            # similar to bove - only change is numerator stock is short
+            if entry_df[pair.split('_')[0]+"_short"]==-1:
+                entry_price_short = float(entry_price_df[pair.split('_')[0]])
+                entry_price_long = float(entry_price_df[pair.split('_')[1]])
+                trading_df = df_ticker_long.iloc[df_ticker_long.index.get_loc(df_ticker_long[df_ticker_long['trade'] == 1].index.min())+2: ]
+
+                if trading_df['exit'].sum()!=0:
+                    exit_df = trading_df.iloc[trading_df.index.get_loc(trading_df[trading_df['exit'] == 1].index.min())]
+                    exit_price_df = trading_df.iloc[trading_df.index.get_loc(trading_df[trading_df['exit'] == 1].index.min())+1]
+                    exit_price_short = float(exit_price_df[pair.split('_')[0]])
+                    exit_price_long = float(exit_price_df[pair.split('_')[1]])
+                else:
+                    exit_price_short = trading_df[pair.split('_')[0]].iloc[-1]
+                    exit_price_long = trading_df[pair.split('_')[1]].iloc[-1]
+                    break;
+                    
+                df_ticker_long = trading_df.iloc[trading_df.index.get_loc(trading_df[trading_df['exit'] == 1].index.min())+2: ]
+
+                stock1_list.append(high_corr_df['level_0'].iloc[i])
+                stock2_list.append(high_corr_df['level_1'].iloc[i])
+                entry_price_s1_list.append(entry_price_short)
+                entry_price_s2_list.append(entry_price_long)
+                exit_price_s1_list.append(exit_price_short)
+                exit_price_s2_list.append(exit_price_long)
+                pos_s1_list.append('short')
+                pos_s2_list.append('long')
+                entry_time_list.append(entry_price_df['Date'])
+                exit_time_list.append(exit_price_df['Date'])
+            else:
+                break;
+
+    # get trade history df
+    df_trade_hist = pd.DataFrame({'stock1':stock1_list,'stock2':stock2_list,'entry_price_s1':entry_price_s1_list,
+                                    'entry_price_s2':entry_price_s2_list,'exit_price_s1':exit_price_s1_list,'exit_price_s2':exit_price_s2_list,
+                                    'pos_s1':pos_s1_list,'pos_s2':pos_s2_list,'entry_time':entry_time_list,
+                                    'exit_time':exit_time_list})
+    return df_trade_hist
+
+
+
+# code for multiprocessing
+def multiProc(high_corr_df,df):
+    cores=1
+    l=len(high_corr_df)
+    n=int(len(high_corr_df)/cores)
+    processes = []
+    try:
+        for i in range(0,len(high_corr_df),n):
+            processes.append([high_corr_df[i:i+n],df])
+    except:
+        print('input')
+
+    a_pool = multiprocessing.Pool(cores)
+    df_minis = a_pool.starmap(backTest, processes)
+    df_maj = pd.concat(df_minis)
+
+    return df_maj
+
+# final trade history df
+df_trade_hist=multiProc(high_corr_df,df)
+
+# caalculate long and short returns
+df_trade_hist['return_long'] = np.where(df_trade_hist['pos_s1']=='long', 
+                                        (df_trade_hist['exit_price_s1']-df_trade_hist['entry_price_s1'])/df_trade_hist['entry_price_s1'],
+                                        (df_trade_hist['exit_price_s2']-df_trade_hist['entry_price_s2'])/df_trade_hist['entry_price_s2'])
+df_trade_hist['return_short'] = np.where(df_trade_hist['pos_s1']=='short', 
+                                        (df_trade_hist['entry_price_s1']-df_trade_hist['exit_price_s1'])/df_trade_hist['entry_price_s1'],
+                                        (df_trade_hist['entry_price_s2']-df_trade_hist['exit_price_s2'])/df_trade_hist['entry_price_s2'])
+
+df_trade_hist['tot_return'] = (df_trade_hist['return_long'] + df_trade_hist['return_short'])/2
+df_trade_hist['tot_return_daily'] = df_trade_hist['tot_return']*365/df_trade_hist['trading_window'].dt.days
+
